@@ -5,13 +5,21 @@ import fitz
 import cv2
 import numpy as np
 import base64
+import uuid
+
 from io import BytesIO
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 
 app = Flask(__name__)
+
 CORS(app)
+
+# =========================
+# LIMIT
+# =========================
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 # =========================
 # MEMORY STORAGE
@@ -39,11 +47,13 @@ def create_gradient(w, h):
     ]
 
     sections = len(colors) - 1
+
     section_h = h // sections
 
     for i in range(sections):
 
         c1 = np.array(colors[i])
+
         c2 = np.array(colors[i + 1])
 
         for y in range(section_h):
@@ -116,11 +126,15 @@ def apply_styling(img, ui_radius, ui_border):
     mask = np.zeros((h, w), dtype=np.uint8)
 
     cv2.rectangle(mask, (r, 0), (w - r, h), 255, -1)
+
     cv2.rectangle(mask, (0, r), (w, h - r), 255, -1)
 
     cv2.circle(mask, (r, r), r, 255, -1)
+
     cv2.circle(mask, (w - r, r), r, 255, -1)
+
     cv2.circle(mask, (r, h - r), r, 255, -1)
+
     cv2.circle(mask, (w - r, h - r), r, 255, -1)
 
     img_bgra[:, :, 3] = mask
@@ -144,7 +158,7 @@ def apply_styling(img, ui_radius, ui_border):
     return img_bgra
 
 # =========================
-# IMAGE TO BASE64
+# BASE64
 # =========================
 def img_to_base64(img):
 
@@ -158,60 +172,111 @@ def img_to_base64(img):
 @app.route("/init", methods=["POST"])
 def init():
 
-    file = request.files["file"]
+    try:
 
-    card_type = request.form.get("type", "aadhaar")
+        if "file" not in request.files:
 
-    # -------- PDF READ --------
+            return jsonify({
+                "error": "No file uploaded"
+            }), 400
 
-    pdf_bytes = file.read()
+        file = request.files["file"]
 
-    doc = fitz.open(
-        stream=pdf_bytes,
-        filetype="pdf"
-    )
+        card_type = request.form.get(
+            "type",
+            "aadhaar"
+        )
 
-    pix = doc[0].get_pixmap(
-        matrix=fitz.Matrix(3, 3)
-    )
+        session_id = str(uuid.uuid4())
 
-    img = cv2.imdecode(
-        np.frombuffer(pix.tobytes(), np.uint8),
-        cv2.IMREAD_COLOR
-    )
+        pdf_bytes = file.read()
 
-    # -------- COORDS --------
+        doc = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
 
-    if card_type == "voter":
+        pix = doc[0].get_pixmap(
+            matrix=fitz.Matrix(3, 3)
+        )
 
-        front_coords = (97, 284, 832, 748)
-        back_coords  = (981, 284, 1714, 748)
+        img = cv2.imdecode(
+            np.frombuffer(
+                pix.tobytes(),
+                np.uint8
+            ),
+            cv2.IMREAD_COLOR
+        )
 
-    else:
+        if img is None:
 
-        front_coords = (146, 1724, 904, 2204)
-        back_coords  = (935, 1724, 1693, 2204)
+            return jsonify({
+                "error": "Invalid PDF"
+            }), 400
 
-    fx1, fy1, fx2, fy2 = front_coords
-    bx1, by1, bx2, by2 = back_coords
+        # =========================
+        # COORDS
+        # =========================
 
-    front = img[fy1:fy2, fx1:fx2]
-    back = img[by1:by2, bx1:bx2]
+        if card_type == "voter":
 
-    # -------- SAVE IN RAM --------
+            front_coords = (
+                97,
+                284,
+                832,
+                748
+            )
 
-    TEMP_DATA["front"] = front
-    TEMP_DATA["back"] = back
+            back_coords = (
+                981,
+                284,
+                1714,
+                748
+            )
 
-    # -------- BASE64 --------
+        else:
 
-    front_base64 = img_to_base64(front)
-    back_base64 = img_to_base64(back)
+            front_coords = (
+                146,
+                1724,
+                904,
+                2204
+            )
 
-    return jsonify({
-        "front": front_base64,
-        "back": back_base64
-    })
+            back_coords = (
+                935,
+                1724,
+                1693,
+                2204
+            )
+
+        fx1, fy1, fx2, fy2 = front_coords
+
+        bx1, by1, bx2, by2 = back_coords
+
+        front = img[fy1:fy2, fx1:fx2]
+
+        back = img[by1:by2, bx1:bx2]
+
+        TEMP_DATA[session_id] = {
+            "front": front,
+            "back": back
+        }
+
+        return jsonify({
+
+            "session_id": session_id,
+
+            "front": img_to_base64(front),
+
+            "back": img_to_base64(back)
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
 
 # =========================
 # GENERATE
@@ -219,162 +284,185 @@ def init():
 @app.route("/generate", methods=["POST"])
 def generate():
 
-    data = request.json
+    try:
 
-    radius = data["radius"]
+        data = request.json
 
-    border = data["border"]
+        session_id = data.get("session_id")
 
-    card_type = data.get("type", "normal")
+        if session_id not in TEMP_DATA:
 
-    # -------- LOAD FROM RAM --------
+            return jsonify({
+                "error": "Session expired"
+            }), 400
 
-    front = TEMP_DATA["front"]
-    back = TEMP_DATA["back"]
+        radius = data["radius"]
 
-    # -------- PVC --------
+        border = data["border"]
 
-    if card_type == "aadhaar_pvc":
-
-        front = apply_gradient_background(front)
-        back = apply_gradient_background(back)
-
-    # -------- STYLE --------
-
-    front = apply_styling(
-        front,
-        radius,
-        border
-    )
-
-    back = apply_styling(
-        back,
-        radius,
-        border
-    )
-
-    # -------- TEMP IMAGE BUFFERS --------
-
-    _, front_png = cv2.imencode(".png", front)
-    _, back_png = cv2.imencode(".png", back)
-
-    front_buffer = BytesIO(front_png.tobytes())
-    back_buffer = BytesIO(back_png.tobytes())
-
-    # -------- PDF --------
-
-    pdf_buffer = BytesIO()
-
-    c = canvas.Canvas(
-        pdf_buffer,
-        pagesize=A4
-    )
-
-    cw = mm_to_pt(86)
-    ch = mm_to_pt(54)
-
-    page_w, page_h = A4
-
-    margin = 30
-
-    start_x = (
-        page_w - ((cw * 2) + margin)
-    ) / 2
-
-    y_pos = page_h - ch - 100
-
-    ui_px_to_mm = 350 / 86
-
-    final_radius_pt = mm_to_pt(
-        radius / ui_px_to_mm
-    )
-
-    final_border_pt = border * 0.3
-
-    # -------- DRAW --------
-
-    def draw_card(canv, img_buffer, x, y, w, h, r, b_width):
-
-        from reportlab.lib.utils import ImageReader
-
-        canv.saveState()
-
-        path = canv.beginPath()
-
-        path.roundRect(x, y, w, h, r)
-
-        canv.clipPath(path, stroke=0, fill=0)
-
-        canv.drawImage(
-            ImageReader(img_buffer),
-            x,
-            y,
-            width=w,
-            height=h,
-            mask='auto'
+        card_type = data.get(
+            "type",
+            "normal"
         )
 
-        canv.restoreState()
+        front = TEMP_DATA[session_id]["front"]
 
-        if b_width > 0:
+        back = TEMP_DATA[session_id]["back"]
 
-            canv.setLineWidth(b_width)
+        if card_type == "aadhaar_pvc":
 
-            canv.setStrokeColorRGB(0, 0, 0)
+            front = apply_gradient_background(front)
 
-            canv.roundRect(
-                x,
-                y,
-                w,
-                h,
-                r,
-                stroke=1,
+            back = apply_gradient_background(back)
+
+        front = apply_styling(
+            front,
+            radius,
+            border
+        )
+
+        back = apply_styling(
+            back,
+            radius,
+            border
+        )
+
+        _, front_png = cv2.imencode(".png", front)
+
+        _, back_png = cv2.imencode(".png", back)
+
+        front_buffer = BytesIO(
+            front_png.tobytes()
+        )
+
+        back_buffer = BytesIO(
+            back_png.tobytes()
+        )
+
+        pdf_buffer = BytesIO()
+
+        c = canvas.Canvas(
+            pdf_buffer,
+            pagesize=A4
+        )
+
+        cw = mm_to_pt(86)
+
+        ch = mm_to_pt(54)
+
+        page_w, page_h = A4
+
+        margin = 30
+
+        start_x = (
+            page_w - ((cw * 2) + margin)
+        ) / 2
+
+        y_pos = page_h - ch - 100
+
+        ui_px_to_mm = 350 / 86
+
+        final_radius_pt = mm_to_pt(
+            radius / ui_px_to_mm
+        )
+
+        final_border_pt = border * 0.3
+
+        def draw_card(
+            canv,
+            img_buffer,
+            x,
+            y,
+            w,
+            h,
+            r,
+            b_width
+        ):
+
+            from reportlab.lib.utils import ImageReader
+
+            canv.saveState()
+
+            path = canv.beginPath()
+
+            path.roundRect(x, y, w, h, r)
+
+            canv.clipPath(
+                path,
+                stroke=0,
                 fill=0
             )
 
-    draw_card(
-        c,
-        front_buffer,
-        start_x,
-        y_pos,
-        cw,
-        ch,
-        final_radius_pt,
-        final_border_pt
-    )
+            canv.drawImage(
+                ImageReader(img_buffer),
+                x,
+                y,
+                width=w,
+                height=h,
+                mask='auto'
+            )
 
-    draw_card(
-        c,
-        back_buffer,
-        start_x + cw + margin,
-        y_pos,
-        cw,
-        ch,
-        final_radius_pt,
-        final_border_pt
-    )
+            canv.restoreState()
 
-    c.save()
+            if b_width > 0:
 
-    pdf_buffer.seek(0)
+                canv.setLineWidth(b_width)
 
-    # -------- CLEAR MEMORY --------
+                canv.setStrokeColorRGB(0, 0, 0)
 
-    TEMP_DATA.clear()
+                canv.roundRect(
+                    x,
+                    y,
+                    w,
+                    h,
+                    r,
+                    stroke=1,
+                    fill=0
+                )
 
-    return send_file(
-        pdf_buffer,
-        as_attachment=True,
-        download_name="card.pdf",
-        mimetype="application/pdf"
-    )
+        draw_card(
+            c,
+            front_buffer,
+            start_x,
+            y_pos,
+            cw,
+            ch,
+            final_radius_pt,
+            final_border_pt
+        )
 
-# =========================
-# RUN
-# =========================
-# if __name__ == "__main__":
+        draw_card(
+            c,
+            back_buffer,
+            start_x + cw + margin,
+            y_pos,
+            cw,
+            ch,
+            final_radius_pt,
+            final_border_pt
+        )
 
-#     app.run(
-#         debug=True,
-#         port=5000
-#     )
+        c.save()
+
+        pdf_buffer.seek(0)
+
+        # =========================
+        # CLEANUP
+        # =========================
+        TEMP_DATA.pop(
+            session_id,
+            None
+        )
+
+        return send_file(
+            pdf_buffer,
+            as_attachment=True,
+            download_name="card.pdf",
+            mimetype="application/pdf"
+        )
+
+    except Exception as e:
+
+        return jsonify({
+            "error": str(e)
+        }), 500
